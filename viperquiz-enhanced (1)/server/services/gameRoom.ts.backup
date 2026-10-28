@@ -1,0 +1,619 @@
+import { getQuestionsByCategory, Question } from "./loadQuestions";
+import { generateQuestionsWithOpenRouter, GeneratedQuestion } from "../_core/openrouter";
+import { generateQuestionsWithDevX } from "../_core/devx";
+import { checkAchievements, type GameStats } from "./achievements";
+import { getAIGeneratedQuestionsByCategory } from "../db";
+import {
+  markQuestionsAsUsed,
+  isQuestionRecentlyUsed,
+  getRecentlyUsedQuestions,
+} from "./questionDeduplication";
+
+const QUESTIONS_PER_GAME = 10;
+const GAME_TIME_LIMIT = 3 * 60 * 1000; // 3 minutes in milliseconds
+
+export interface Player {
+  id: string;
+  name: string;
+  score: number;
+  correctAnswers: number;
+  totalAnswered: number;
+  isReady: boolean;
+  lastAnswerTime?: number;
+  hasAnsweredCurrentQuestion?: boolean;
+  answers: Map<number, string>; // Maps question index to answer (A, B, C, D)
+  earnedAchievements: string[]; // Achievement IDs earned in this game
+  playerQuestionIndex: number; // Each player's current question (0-9)
+  skippedQuestions: Set<number>; // Tracks which questions (0-9) were skipped
+  completedAllQuestions: boolean; // True when all 10 questions answered (including retries)
+}
+
+export interface GameRoom {
+  roomCode: string;
+  hostId: string;
+  category: string;
+  categoryId?: number; // For custom AI categories
+  difficulty?: "easy" | "medium" | "hard"; // Game difficulty level
+  customTopic?: string; // Custom topic for AI-generated questions
+  maxPlayers: number;
+  players: Map<string, Player>;
+  status: "waiting" | "playing" | "finished";
+  currentQuestionIndex: number; // 0-9 for the 10 questions
+  allQuestions: Question[]; // All 10 questions for this game (loaded at start)
+  createdAt: Date;
+  startedAt?: Date;
+  endedAt?: Date;
+  gameStartTime?: number; // Server-side timer start (milliseconds)
+  gameExpiresAt?: number; // When 3 minutes is up (milliseconds)
+}
+
+export class GameRoomManager {
+  private rooms: Map<string, GameRoom> = new Map();
+  private playerToRoom: Map<string, string> = new Map(); // Maps player ID to room code
+
+  createRoom(hostId: string, hostName: string, maxPlayers: number = 15): GameRoom {
+    const roomCode = this.generateRoomCode();
+    const room: GameRoom = {
+      roomCode,
+      hostId,
+      category: "",
+      maxPlayers,
+      players: new Map(),
+      status: "waiting",
+      currentQuestionIndex: 0,
+      allQuestions: [],
+      createdAt: new Date(),
+    };
+
+    // Add host to the room
+    const hostPlayer: Player = {
+      id: hostId,
+      name: hostName,
+      score: 0,
+      correctAnswers: 0,
+      totalAnswered: 0,
+      isReady: false,
+      hasAnsweredCurrentQuestion: false,
+      answers: new Map(),
+      earnedAchievements: [],
+      playerQuestionIndex: 0,
+      skippedQuestions: new Set(),
+      completedAllQuestions: false,
+    };
+    room.players.set(hostId, hostPlayer);
+    this.playerToRoom.set(hostId, roomCode);
+
+    this.rooms.set(roomCode, room);
+    return room;
+  }
+
+  joinRoom(roomCode: string, playerId: string, playerName: string): GameRoom | null {
+    const room = this.rooms.get(roomCode);
+    if (!room) return null;
+
+    if (room.players.size >= room.maxPlayers) return null;
+    if (room.status !== "waiting") return null;
+
+    const player: Player = {
+      id: playerId,
+      name: playerName,
+      score: 0,
+      correctAnswers: 0,
+      totalAnswered: 0,
+      isReady: false,
+      hasAnsweredCurrentQuestion: false,
+      answers: new Map(),
+      earnedAchievements: [],
+      playerQuestionIndex: 0,
+      skippedQuestions: new Set(),
+      completedAllQuestions: false,
+    };
+    room.players.set(playerId, player);
+    this.playerToRoom.set(playerId, roomCode);
+
+    return room;
+  }
+
+  leaveRoom(roomCode: string, playerId: string): void {
+    const room = this.rooms.get(roomCode);
+    if (!room) return;
+
+    room.players.delete(playerId);
+    this.playerToRoom.delete(playerId);
+
+    if (room.players.size === 0) {
+      this.rooms.delete(roomCode);
+    }
+  }
+
+  getRoom(roomCode: string): GameRoom | null {
+    return this.rooms.get(roomCode) || null;
+  }
+
+  setPlayerReady(roomCode: string, playerId: string, isReady: boolean): void {
+    const room = this.rooms.get(roomCode);
+    const player = room?.players.get(playerId);
+
+    if (player) {
+      player.isReady = isReady;
+    }
+  }
+
+  async startGame(roomCode: string, category: string, difficulty?: "easy" | "medium" | "hard", customTopic?: string): Promise<boolean> {
+    const room = this.rooms.get(roomCode);
+    if (!room) return false;
+    if (room.players.size < 2) return false; // Minimum 2 players required
+
+    room.status = "playing";
+    room.category = category;
+    room.difficulty = difficulty;
+    room.customTopic = customTopic;
+    room.gameStartTime = Date.now();
+    room.gameExpiresAt = room.gameStartTime + GAME_TIME_LIMIT; // 3 minutes from now
+    room.startedAt = new Date();
+
+    // Load all 10 questions at game start (synchronized for all players)
+    // IMPORTANT: Must await to ensure questions are loaded before game starts
+    await this.loadAllQuestions(roomCode);
+    return true;
+  }
+
+  async loadAllQuestions(roomCode: string): Promise<void> {
+    const room = this.rooms.get(roomCode);
+    if (!room) return;
+
+    let allCategoryQuestions: Question[] = [];
+
+    // Load from custom AI category if categoryId is set, otherwise load from built-in categories
+    if (room.categoryId) {
+      try {
+        const aiQuestions = await getAIGeneratedQuestionsByCategory(room.categoryId);
+        allCategoryQuestions = aiQuestions.map((q) => ({
+          id: q.id,
+          category: room.category,
+          question: q.question,
+          optionA: q.optionA,
+          optionB: q.optionB,
+          optionC: q.optionC,
+          optionD: q.optionD,
+          correctAnswer: q.correctAnswer as "A" | "B" | "C" | "D",
+          difficulty: q.difficulty as "easy" | "medium" | "hard",
+        }));
+      } catch (error) {
+        console.error(`[GameRoom] Failed to load AI questions for category ${room.categoryId}:`, error);
+        return;
+      }
+    } else {
+      allCategoryQuestions = getQuestionsByCategory(room.category);
+    }
+
+    // If no built-in questions found, try to generate with OpenRouter immediately
+    if (!allCategoryQuestions || allCategoryQuestions.length === 0) {
+      console.log(`[GameRoom] No built-in questions for ${room.category}, attempting OpenRouter generation...`);
+      try {
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('OpenRouter request timeout')), 10000)
+        );
+        
+        const generatedQuestions = await Promise.race([
+          generateQuestionsWithOpenRouter(room.category, QUESTIONS_PER_GAME),
+          timeoutPromise
+        ]) as any[];
+        
+        if (generatedQuestions && generatedQuestions.length === QUESTIONS_PER_GAME) {
+          const convertedQuestions: Question[] = generatedQuestions.map((q, idx) => ({
+            id: idx + 1,
+            category: room.category,
+            question: q.question,
+            optionA: q.optionA,
+            optionB: q.optionB,
+            optionC: q.optionC,
+            optionD: q.optionD,
+            correctAnswer: q.correctAnswer,
+            difficulty: q.difficulty,
+          }));
+          room.allQuestions = convertedQuestions;
+          console.log(`[GameRoom] Successfully generated ${QUESTIONS_PER_GAME} questions for ${room.category}`);
+          return;
+        }
+      } catch (error) {
+        console.error(`[GameRoom] Failed to generate questions for ${room.category}:`, error);
+      }
+      return;
+    }
+
+    // Get recently used questions to avoid repetition across game rooms
+    const recentlyUsed = getRecentlyUsedQuestions(room.category);
+
+    // Randomly select 10 unique questions from the category, excluding recently used ones
+    const selectedQuestions: Question[] = [];
+    const usedIndices = new Set<number>();
+    let attemptCount = 0;
+    const maxAttempts = allCategoryQuestions.length * 3; // Prevent infinite loops
+
+    while (selectedQuestions.length < QUESTIONS_PER_GAME && attemptCount < maxAttempts) {
+      attemptCount++;
+      const randomIndex = Math.floor(Math.random() * allCategoryQuestions.length);
+      
+      if (!usedIndices.has(randomIndex)) {
+        const question = allCategoryQuestions[randomIndex];
+        
+        // Skip if this question was recently used
+        if (recentlyUsed.includes(question.question)) {
+          continue;
+        }
+        
+        // Skip if difficulty doesn't match (if difficulty is specified)
+        if (room.difficulty && question.difficulty !== room.difficulty) {
+          continue;
+        }
+        
+        usedIndices.add(randomIndex);
+        selectedQuestions.push(question);
+      }
+    }
+
+    // If we couldn't find enough unique questions, log a warning
+    if (selectedQuestions.length < QUESTIONS_PER_GAME) {
+      console.warn(
+        `[GameRoom] Only found ${selectedQuestions.length}/${QUESTIONS_PER_GAME} unique questions for ${room.category}. ` +
+        `${recentlyUsed.length} questions were recently used. Reusing some recent questions.`
+      );
+    }
+
+    room.allQuestions = selectedQuestions;
+    room.currentQuestionIndex = 0;
+
+    // Three-tier fallback: DevX (primary) → OpenRouter (secondary) → Saved (tertiary)
+    let generatedQuestions: GeneratedQuestion[] | null = null;
+    
+    try {
+      // Tier 1: Try DevX API (primary, fastest)
+      console.log(`[GameRoom] Tier 1: Attempting DevX API for ${room.category}...`);
+      const devxTimeout = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('DevX timeout')), 10000)
+      );
+      
+      try {
+        generatedQuestions = await Promise.race([
+          generateQuestionsWithDevX(room.category, QUESTIONS_PER_GAME),
+          devxTimeout
+        ]) as GeneratedQuestion[] | null;
+        
+        if (generatedQuestions && generatedQuestions.length > 0) {
+          console.log(`[GameRoom] ✓ DevX API succeeded with ${generatedQuestions.length} questions`);
+        } else {
+          console.log(`[GameRoom] DevX returned no questions, trying Tier 2...`);
+          generatedQuestions = null;
+        }
+      } catch (devxError) {
+        console.warn(`[GameRoom] Tier 1 (DevX) failed:`, (devxError as Error).message);
+        generatedQuestions = null;
+      }
+      
+      // Tier 2: Try OpenRouter (secondary, fallback)
+      if (!generatedQuestions) {
+        console.log(`[GameRoom] Tier 2: Attempting OpenRouter for ${room.category}...`);
+        const openrouterTimeout = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('OpenRouter timeout')), 15000)
+        );
+        
+        try {
+          generatedQuestions = await Promise.race([
+            generateQuestionsWithOpenRouter(room.category, QUESTIONS_PER_GAME),
+            openrouterTimeout
+          ]) as GeneratedQuestion[] | null;
+          
+          if (generatedQuestions && generatedQuestions.length > 0) {
+            console.log(`[GameRoom] ✓ OpenRouter succeeded with ${generatedQuestions.length} questions`);
+          } else {
+            console.log(`[GameRoom] OpenRouter returned no questions, using Tier 3...`);
+            generatedQuestions = null;
+          }
+        } catch (orError) {
+          console.warn(`[GameRoom] Tier 2 (OpenRouter) failed:`, (orError as Error).message);
+          generatedQuestions = null;
+        }
+      }
+      
+      // Tier 3: Use saved questions (tertiary, always available)
+      if (!generatedQuestions) {
+        console.log(`[GameRoom] Tier 3: Using saved questions for ${room.category}`);
+        console.log(`[GameRoom] ✓ Using ${selectedQuestions.length} saved questions`);
+      } else {
+        // Convert generated questions to Question format
+        const convertedQuestions: Question[] = generatedQuestions.map((q, idx) => ({
+          id: idx + 1,
+          category: room.category,
+          question: q.question,
+          optionA: q.optionA,
+          optionB: q.optionB,
+          optionC: q.optionC,
+          optionD: q.optionD,
+          correctAnswer: q.correctAnswer,
+          difficulty: q.difficulty,
+        }));
+
+        if (convertedQuestions.length === QUESTIONS_PER_GAME) {
+          room.allQuestions = convertedQuestions;
+          console.log(`[GameRoom] Successfully loaded ${convertedQuestions.length} generated questions`);
+        } else {
+          console.warn(`[GameRoom] Generated only ${convertedQuestions.length}/${QUESTIONS_PER_GAME} questions`);
+          room.allQuestions = convertedQuestions;
+        }
+      }
+    } catch (error) {
+      console.error(`[GameRoom] Unexpected error in question generation:`, error);
+      // Tier 3 fallback already in place
+    }
+  }
+
+  getCurrentQuestion(roomCode: string, playerId?: string): Question | null {
+    const room = this.rooms.get(roomCode);
+    if (!room) return null;
+
+    // Check if game time has expired
+    if (room.gameExpiresAt && Date.now() >= room.gameExpiresAt) {
+      room.status = "finished";
+      room.endedAt = new Date();
+      return null;
+    }
+
+    if (!playerId) return null;
+
+    const player = room.players.get(playerId);
+    if (!player) return null;
+
+    // If player has completed all 10 questions, check for skipped questions
+    if (player.playerQuestionIndex >= QUESTIONS_PER_GAME) {
+      // Find first unanswered (skipped) question - check for empty string (skipped) or missing key
+      for (let i = 0; i < QUESTIONS_PER_GAME; i++) {
+        const answer = player.answers.get(i);
+        if (!answer || answer === "") {
+          // Return the skipped question for retry
+          return room.allQuestions[i] || null;
+        }
+      }
+      // All questions answered
+      player.completedAllQuestions = true;
+      return null;
+    }
+
+    // Return current question
+    return room.allQuestions[player.playerQuestionIndex] || null;
+  }
+
+  submitAnswer(
+    roomCode: string,
+    playerId: string,
+    answer: string,
+    timeSpent: number
+  ): { correct: boolean; points: number; correctAnswer?: string } {
+    const room = this.rooms.get(roomCode);
+    const player = room?.players.get(playerId);
+
+    if (!room || !player) {
+      return { correct: false, points: 0 };
+    }
+
+    // Check if game time has expired
+    if (room.gameExpiresAt && Date.now() >= room.gameExpiresAt) {
+      room.status = "finished";
+      room.endedAt = new Date();
+      return { correct: false, points: 0 };
+    }
+
+    const currentQuestion = this.getCurrentQuestion(roomCode, playerId);
+    if (!currentQuestion) {
+      return { correct: false, points: 0 };
+    }
+
+    // Find which question index this is (could be a skipped question being retried)
+    let questionIndex = player.playerQuestionIndex;
+    if (player.playerQuestionIndex >= QUESTIONS_PER_GAME) {
+      // Player is in retry phase - find which skipped question this is
+      for (let i = 0; i < QUESTIONS_PER_GAME; i++) {
+        if (!player.answers.has(i)) {
+          questionIndex = i;
+          break;
+        }
+      }
+    }
+
+    console.log(`[submitAnswer] Player ${playerId}: playerQuestionIndex=${player.playerQuestionIndex}, questionIndex=${questionIndex}, answer=${answer}`);
+
+    // Check if player already answered this question
+    if (player.answers.has(questionIndex)) {
+      console.log(`[submitAnswer] Player ${playerId}: Already answered question ${questionIndex}`);
+      return { correct: false, points: 0 };
+    }
+
+    // Validate answer format - must be exactly A, B, C, or D
+    if (!["A", "B", "C", "D"].includes(answer.toUpperCase())) {
+      return { correct: false, points: 0 };
+    }
+
+    // Compare answer with correct answer (case-insensitive)
+    const isCorrect = answer.toUpperCase() === currentQuestion.correctAnswer.toUpperCase();
+    let points = 0;
+
+    // Store the answer
+    console.log(`[submitAnswer] Storing answer for Q${questionIndex}: ${answer.toUpperCase()}`);
+    player.answers.set(questionIndex, answer.toUpperCase());
+    console.log(`[submitAnswer] Answers now: [${Array.from(player.answers.keys()).join(',')}]`);
+
+    if (isCorrect) {
+      // Calculate points based on difficulty and time spent
+      const basePoints: Record<string, number> = {
+        easy: 10,
+        medium: 20,
+        hard: 30,
+      };
+
+      const timeBonus = Math.max(0, 5 - Math.floor(timeSpent / 1000)); // Bonus for quick answers
+      points = (basePoints[currentQuestion.difficulty] || 10) + timeBonus;
+
+      player.score += points;
+      player.correctAnswers++;
+    }
+
+    player.totalAnswered++;
+    player.lastAnswerTime = Date.now();
+
+    // If we're in the retry phase (answering skipped questions), don't advance playerQuestionIndex
+    // Just mark the answer and let getCurrentQuestion find the next skipped question
+    if (player.playerQuestionIndex < QUESTIONS_PER_GAME) {
+      player.playerQuestionIndex++;
+    }
+
+    // NOTE: Game should NOT end early even if all players finish all questions
+    // The game must run for the full 3-minute duration (gameExpiresAt)
+    // Players who finish early will see a "Waiting for game to end..." message
+
+    // Return the correct answer if the player's answer was incorrect
+    return { 
+      correct: isCorrect, 
+      points,
+      correctAnswer: !isCorrect ? currentQuestion.correctAnswer : undefined
+    };
+  }
+
+  // Advance to next question (called when all players answered or time expired)
+  advanceToNextQuestion(roomCode: string): void {
+    const room = this.rooms.get(roomCode);
+    if (!room) return;
+
+    if (room.currentQuestionIndex < QUESTIONS_PER_GAME) {
+      room.currentQuestionIndex++;
+    }
+
+    // Reset answered flag for all players
+    room.players.forEach((player) => {
+      player.hasAnsweredCurrentQuestion = false;
+    });
+  }
+
+  // Check if all players have answered the current question
+  haveAllPlayersAnswered(roomCode: string): boolean {
+    const room = this.rooms.get(roomCode);
+    if (!room) return false;
+
+    // All players must have answered
+    const players = Array.from(room.players.values());
+    for (let i = 0; i < players.length; i++) {
+      if (!players[i].hasAnsweredCurrentQuestion) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  // Get leaderboard sorted by score
+  getLeaderboard(roomCode: string): Player[] {
+    const room = this.rooms.get(roomCode);
+    if (!room) return [];
+
+    const players = Array.from(room.players.values());
+    const sorted = players.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.correctAnswers !== a.correctAnswers) return b.correctAnswers - a.correctAnswers;
+      return a.name.localeCompare(b.name);
+    });
+    
+    // Check achievements for each player
+    sorted.forEach((player, index) => {
+      const gameStats: GameStats = {
+        score: player.score,
+        correctAnswers: player.correctAnswers,
+        totalAnswered: player.totalAnswered,
+        timeSpentSeconds: room.startedAt && room.endedAt 
+          ? (room.endedAt.getTime() - room.startedAt.getTime()) / 1000 
+          : 0,
+        category: room.category,
+        playerRank: index + 1,
+        totalPlayers: sorted.length,
+        questionsAnswered: player.totalAnswered,
+      };
+      
+      const achievements = checkAchievements(gameStats);
+      player.earnedAchievements = achievements;
+    });
+    
+    return sorted;
+  }
+
+  getTimeRemaining(roomCode: string): number {
+    const room = this.rooms.get(roomCode);
+    if (!room || !room.gameExpiresAt) return 0;
+
+    const remaining = Math.max(0, room.gameExpiresAt - Date.now());
+    return remaining;
+  }
+
+  // Skip current question and move to next
+  skipQuestion(roomCode: string, playerId: string): boolean {
+    const room = this.rooms.get(roomCode);
+    const player = room?.players.get(playerId);
+
+    if (!room || !player) return false;
+
+    // Get current question index
+    let questionIndex = player.playerQuestionIndex;
+    if (player.playerQuestionIndex >= QUESTIONS_PER_GAME) {
+      // In retry phase - find which skipped question this is
+      for (let i = 0; i < QUESTIONS_PER_GAME; i++) {
+        if (!player.answers.has(i)) {
+          questionIndex = i;
+          break;
+        }
+      }
+    }
+
+    // Mark question as skipped (store empty string as placeholder)
+    player.answers.set(questionIndex, "");
+    player.skippedQuestions.add(questionIndex);
+
+    // Move to next question
+    if (player.playerQuestionIndex < QUESTIONS_PER_GAME) {
+      player.playerQuestionIndex++;
+    }
+
+    return true;
+  }
+
+  // Get skipped questions for a player
+  getSkippedQuestions(roomCode: string, playerId: string): number[] {
+    const room = this.rooms.get(roomCode);
+    const player = room?.players.get(playerId);
+
+    if (!room || !player) return [];
+
+    return Array.from(player.skippedQuestions).sort((a, b) => a - b);
+  }
+
+  // Check if player has completed all questions (including skipped ones)
+  hasCompletedAllQuestions(roomCode: string, playerId: string): boolean {
+    const room = this.rooms.get(roomCode);
+    const player = room?.players.get(playerId);
+
+    if (!room || !player) return false;
+
+    // Must have answered all 10 questions (not skipped)
+    for (let i = 0; i < QUESTIONS_PER_GAME; i++) {
+      const answer = player.answers.get(i);
+      if (answer === undefined || answer === "") {
+        return false; // Still skipped or unanswered
+      }
+    }
+
+    return true;
+  }
+
+  private generateRoomCode(): string {
+    return Math.random().toString(36).substring(2, 8).toUpperCase();
+  }
+}
+
+// Singleton instance
+export const gameRoomManager = new GameRoomManager();

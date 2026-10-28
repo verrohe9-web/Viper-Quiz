@@ -1,0 +1,18 @@
+export const ENV = {
+  appId: process.env.VITE_APP_ID ?? "",
+  cookieSecret: process.env.JWT_SECRET ?? "",
+  databaseUrl: process.env.DATABASE_URL ?? "",
+  oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
+  ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
+  isProduction: process.env.NODE_ENV === "production",
+  darajaCollectionPhone: process.env.MANUAL_PILOT_COLLECTION_PHONE ?? "",
+  airtelCollectionPhone: process.env.AIRTEL_COLLECTION_PHONE ?? "",
+  forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
+  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
+  openrouterApiKey: process.env.OPENROUTER_API_KEY ?? "",
+  airtelBaseUrl: process.env.AIRTEL_BASE_URL ?? "",
+  airtelClientId: process.env.AIRTEL_CLIENT_ID ?? "",
+  airtelClientSecret: process.env.AIRTEL_CLIENT_SECRET ?? "",
+  airtelApiKey: process.env.AIRTEL_API_KEY ?? "",
+  airtelCallbackUrl: process.env.AIRTEL_CALLBACK_URL ?? "",
+};

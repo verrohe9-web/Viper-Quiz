@@ -1,0 +1,83 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1782067728463,
+      "tag": "0000_mighty_winter_soldier",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1782067776109,
+      "tag": "0001_careless_nico_minoru",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1782366027228,
+      "tag": "0002_daily_scorpion",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1782572652126,
+      "tag": "0003_striped_wolf_cub",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1782685113424,
+      "tag": "0004_material_blockbuster",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1782685506804,
+      "tag": "0005_fuzzy_medusa",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1782685761065,
+      "tag": "0006_reflective_black_crow",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1782802438701,
+      "tag": "0007_lowly_lionheart",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "5",
+      "when": 1782803542585,
+      "tag": "0008_little_ronan",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "5",
+      "when": 1787773713315,
+      "tag": "0009_watery_swordsman",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "5",
+      "when": 1788152552699,
+      "tag": "0011_daraja_provider_defaults",
+      "breakpoints": true
+    }
+  ]
+}

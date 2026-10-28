@@ -1,0 +1,2 @@
+ALTER TABLE `gamePayments` MODIFY COLUMN `provider` varchar(30) NOT NULL DEFAULT 'daraja_mpesa';--> statement-breakpoint
+ALTER TABLE `gamePayouts` MODIFY COLUMN `provider` varchar(30) NOT NULL DEFAULT 'daraja_mpesa';
